@@ -1,146 +1,84 @@
-# Mimir MCP Server — Architecture Document
+# Cassandra-Viam-MCP architecture
 
-Version: Draft 0.1 · Date: November 1, 2026 · Status: Decisions made; the SRS will be written from this document
+**Status:** Proposed for implementation · **Date:** 2026-11-08
 
-## 1. Purpose and scope
+Cassandra-Viam-MCP gives Cassandra Collective projects a shared research memory. It connects versioned public research to the Collective's decisions, hypotheses, and experiment results so engineers and their agents can ask what changed, how a result was obtained, and whether it applies to their project. Mimir is the server name used in the original design.
 
-This document describes the architecture of Mimir, a Rust-based MCP (Model Context Protocol) server for the Cassandra project.
+The first release is a read-only knowledge service. Its coverage includes LLM architecture, training algorithms and optimization, pretraining, post-training, evaluation and agent harnesses, and relevant AI, machine learning, and data science methods. Cassandra model inference and tool use are later integrations. The [requirements and build plan](docs/specification.md) defines the first release and its acceptance gates. The [AI But Simple investigation](docs/research/ai-but-simple.md) records the public behavior that informed the design.
 
-**Purpose:** Let AI agents such as Claude, Codex and Gemini read Cassandra's decisions, hypotheses and experiment results with sources, instead of guessing. In a second phase, the Cassandra model itself should be able to use tools.
+## Decisions
 
-**Out of scope (for now):** Training the Cassandra model, extending its vocabulary, and indexing the Chorus and Ephesus repositories in the first release (the architecture is designed to accommodate them).
+| Area | Design |
+| --- | --- |
+| Runtime | Rust with `tokio`, `axum`, `rmcp`, `schemars`, `serde`, and `tracing`. Pin the Rust toolchain, SDK version, and supported client protocol revisions after the compatibility spike. |
+| Persistence | `rusqlite` with SQLite and FTS5 on a single host. Keep versioned evidence and published snapshots in normalized tables. FTS5 is a rebuildable projection. |
+| Delivery | Stateless Streamable HTTP over HTTPS for shared access. Stdio may serve as a local development and contract-test transport. |
+| Sources | Allowlisted GitHub repos for Collective evidence, arXiv for research discovery, and selected GitHub releases for implementation changes. Add opt-in adapters as coverage needs become measurable. |
+| Ranking | Apply visibility, scope, and status filters first. Rank lexical relevance, then use explicit versioned preferences for freshness or evidence strength. Popularity is discovery metadata. |
+| Trust | Every factual result points to source versions and locators. Editorial notes, author claims, internal runs, and independent reproductions have separate identities and review states. |
+| Deployment | Begin with one Linux host, one writer, Caddy for TLS, and a service manager. Select the hosting provider after capacity and cost verification. |
 
-## 2. Decision summary
+## Components and data flow
 
-- **Language and SDK:** Rust with the official `rmcp` SDK (v3.x, supports the MCP 2026-07-28 specification).
-- **Transport:** Streamable HTTP over HTTPS (stdio was considered at first, then replaced).
-- **Session model:** Stateless. State lives in the index, not in the protocol.
-- **Data source:** GitHub repositories. The server clones and updates them itself.
-- **Hosting:** Cloud, Oracle Cloud Always Free (Arm VM). Not final; depends on capacity and quota.
-- **Approach:** Read-only knowledge server; every answer cites its source (`repo@commit`).
-- **Phases:** Phase 1 is a knowledge server for agents; Phase 2 lets Cassandra use tools.
-
-## 3. System architecture
-
-```
-Claude / Codex / Gemini        Python controller (Phase 2)
-          |                              |
-          +---------- HTTPS -------------+
-                        |
-                 Caddy (TLS, Let's Encrypt)
-                        |
-        +---------------+----------------+
-        |   mimir-mcp (Rust, rmcp)       |
-        |                                |
-        |   Tool handler layer           |
-        |      |                 |       |
-        |  Knowledge     Model runner    |
-        |      |                 |       |
-        |  Index (SQLite)  Python child  |
-        +------|-----------------|-------+
-               |                 |
-      Repo clones (GitHub)   Model weights
+```mermaid
+flowchart LR
+    Internal[Allowlisted Collective repos] --> Sync[Git snapshot sync]
+    External[Official public APIs] --> Sync
+    Sync --> Stage[Validate and stage source revisions]
+    Stage --> Store[(Versioned SQLite evidence)]
+    Review[Reviewed notes and claim links] --> Store
+    Store --> Publish[Publish complete source snapshots]
+    Publish --> Index[(Queryable snapshots and FTS5)]
+    Clients[Project developers and MCP clients] --> Gateway[TLS and auth]
+    Gateway --> Tools[Read-only MCP handlers]
+    Tools --> Knowledge[Rust knowledge service]
+    Knowledge --> Index
 ```
 
-Requests arrive from outside at Caddy, which terminates TLS and forwards them to the Rust server over `127.0.0.1`. The server handles the MCP request in the tool handler layer and delegates the work to the service below.
+- **Sync worker.** A scheduler claims a per-source lease and acquires a bounded refresh window. Adapters fetch allowlisted data and stage records with provenance and parse diagnostics. A GitHub webhook can enqueue a refresh after signature verification. Periodic reconciliation covers missed webhooks.
+- **Publisher.** After a complete bounded run, one transaction makes the source snapshot visible, updates its FTS projection and successful watermark, and records its source coverage. A new revision creates an immutable version. A failed run keeps the previous published state readable. Any staging cursor is separate from the published watermark.
+- **Review workflow.** A reviewer adds a technique note, links claims to evidence, or corrects a relation through versioned review inputs. A discovered item can appear immediately as a candidate. A reviewed summary requires a reviewer, review time, version, and evidence links. Source changes can invalidate those links and queue the summary for re-review.
+- **Knowledge service.** Pure Rust query and comparison logic owns evidence selection, scope, pagination, and time semantics. It reads a consistent snapshot per call and hands typed results to the MCP adapter. It can be tested against a fixture database without a host or model.
+- **MCP adapter.** Declares the supported tool schemas and validates input and access before querying. It emits structured results and a JSON text fallback for clients that need it. It never fetches user-supplied URLs on behalf of a tool call.
 
-## 4. Layers
+### Sources and identity
 
-### 4.1 Tool handler layer
+Collective sources use `owner/repo`, configured ref, resolved commit, file path, and section or line range. Fetch into a managed mirror, then parse the immutable Git tree for the resolved commit and approved paths. Track deleted or renamed paths on subsequent snapshots. Keep internal evidence in its configured access scope.
 
-The only layer that knows about MCP. It defines tools, resources and prompts with `rmcp` and generates parameter schemas with `schemars`. Errors are returned as tool results carrying `isError`, not as protocol errors, so the agent can see the failure and correct itself. It does not depend directly on the service layers below; it talks to them through traits.
+External sources use provider-native IDs, version identifiers where available, retrieval timestamps, content digests, and canonical URLs. For an editable release or card without an immutable URL, retain the provider ID, observed revision, and a rights-permitted snapshot or digest. A paper and a linked implementation remain separate records. Link them with an explicit relation. Merge cross-provider duplicates only on a verified ID match or reviewed mapping.
 
-### 4.2 Knowledge service
+| Record | Stable data and relationships |
+| --- | --- |
+| `Source` and `SyncRun` | Source ID, adapter and watch configuration, access scope, attempt and completion times, coverage, cursor, errors, and published snapshot ID. |
+| `Work` and `SourceRevision` | Stable entity ID, type, provider aliases, immutable revision ID, canonical and version URLs, source dates, discovery time, digest, license decision, visibility, and supersession or withdrawal state. |
+| `Claim` and `EvidenceLink` | Bounded statement, setup and applicability, evidence type, immutable revision and locator, relation (`supports`, `contradicts`, `qualifies`), and review history. |
+| `Technique` and `ProjectDecision` | Curated explanations and Collective ADRs with versioned links to claims, implementations, datasets, evaluations, hypotheses, and experiment stages. |
+| `Publication` | Queryable snapshot ID and admission time, constituent source generations, index schema and ranking versions, and per-source freshness state. |
 
-Pure Rust, independent of MCP, testable on its own. It holds the search, claim-to-evidence matching and project comparison logic. Every result returns with the file and commit it came from.
+Dates are separate fields. `published_at` and `source_updated_at` describe the source. `discovered_at` and `admitted_at` describe ingestion and publication by Viam. `reviewed_at` describes human review. `as_of` selects the most recent eligible Viam publication at or before the requested UTC time. Older evidence outside the retained publication window returns an explicit coverage error. A later discovery about older work enters the timeline when Viam admitted it.
 
-### 4.3 Index
+### Serving freshness and corrections
 
-At startup the repository files are scanned, markdown and frontmatter are parsed and written to SQLite FTS5. When a repository updates, the index is rebuilt. The index can always be regenerated from the repositories, which remain the single source of truth.
+Each source has its own poll interval, maximum acceptable age, and bounded scope. A scoped read carries the published generation, `as_of`, and health of the sources it used. A recent success means the configured window was checked successfully. It does not imply global coverage of a field or verification of every discovered claim.
 
-### 4.4 Model runner
+When an adapter fails, retain its last good snapshot and distinguish `stale`, `unavailable`, and `partial` coverage from a successful empty result. Report both the snapshot's coverage and the latest known refresh status for current reads. Historical reads report coverage recorded for the selected publication. A retraction or superseding revision records a new state, retains historical evidence, and makes affected claims ineligible for current recommendations until review. Explicit history reads can still retrieve superseded versions with their status. Access revocation and license removal are enforced against current policy even for historical queries.
 
-Runs Cassandra's Python inference code as a subprocess. The rest of the server is independent of this layer. If the model is missing or fails to start, only the `sample_text` tool is disabled.
+### Search and comparison
 
-### 4.5 Repository sync
+Use FTS5 to find candidates across allowed titles, aliases, metadata, and approved excerpts. Index by revision and filter through publication membership so current and retained historical queries can resolve different versions. Resolve topic, date, project, artifact type, and evidence filters in SQL. Rank with versioned features such as title, alias, and term matches whose scores stay fixed for a publication, then break ties by stable ID. An opaque cursor binds the publication, query, and authorization scope. Use a versioned, deterministic policy for the weekly digest and include the reason each item qualified. [SQLite FTS5](https://sqlite.org/fts5.html)
 
-Repositories are cloned shallowly at startup. A GitHub webhook signals each push; the server runs `git fetch` and refreshes the index. If the webhook fails, a periodic `git fetch` acts as a fallback.
+`compare_methods` aligns results on evaluation protocol, model and size, dataset and split, metric and direction, budget, baseline, and harness version when those dimensions apply. Report missing context or incompatible measurements explicitly. A new paper may qualify a Collective decision through a reviewed relationship. It cannot overwrite an internal result or change the decision automatically.
 
-## 5. MCP surface
+## Protocol and deployment
 
-### 5.1 Tools (Phase 1)
+Use the official Rust MCP SDK and test the supported protocol versions against actual clients. The July 2026 protocol uses per-request metadata and server discovery. Older clients may require the legacy initialization flow. Keep wire compatibility separate from the version of the Viam result schema. Capability claims for individual Codex, Claude, and Gemini clients depend on the compatibility gate. [Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) · [MCP July 2026 changes](https://blog.modelcontextprotocol.io/posts/2026-07-28/) · [MCP tools specification](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
 
-- `list_decisions`, `get_decision`: list and fetch ADRs.
-- `list_hypotheses`, `get_hypothesis`: fetch hypotheses together with their verdicts.
-- `list_stages`, `get_stage_result`: fetch experiment stages and their result summaries.
-- `search_docs`: full-text search across all documents; every result carries `file@commit`.
-- `get_claim_status(claim)`: find which ADR, hypothesis or stage evidence supports or refutes a claim.
-- `compare_projects(a, b, axis)`: compare two projects along given axes (once Chorus and Ephesus are added).
+Bind the MCP process to loopback behind Caddy. Require authentication and scope checks before retrieval, validate browser Origin on HTTP, and keep private project evidence separate from public results in storage, caches, and logs. Use the applicable MCP authorization profile for the selected shared clients. A private operator-only pilot can use managed credentials and restricted network access after a connection test. Source credentials and webhook signing secrets are isolated from query handlers. [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) · [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
 
-### 5.2 Model tool (Phase 1.5)
+Run one scheduled writer and open read-only database connections in the serving process. Record last successful refresh, ingest lag, snapshot publication, pending reviews, and query latency. Keep backups of versioned evidence, review inputs, and checkpoint state. Test restoration and FTS rebuild before a shared rollout. See the [operational gates](docs/specification.md#phase-3--shared-pilot).
 
-- `sample_text(prompt, max_chars, temperature)`: generate sample text from Cassandra. The tool description states the model's short context window.
+## Later work
 
-### 5.3 Resources
-
-- Model card, results summary and agent guidelines (`MODEL_CARD.md`, `RESULTS.md`, `AGENT.md`).
-
-### 5.4 Prompts
-
-- Ready-made comparison templates (for example, compare two architectures along given axes).
-
-## 6. Transport, security and operations
-
-- **Authentication:** Every request is checked for an `Authorization: Bearer` header; a wrong token returns 401. The token is supplied through an environment variable and never kept in code.
-- **Origin check:** The `Origin` header is validated to guard against browser-originated requests.
-- **Rate limiting:** Requests are limited, especially for `sample_text`, because it consumes CPU.
-- **Webhook security:** The GitHub webhook signature (HMAC secret) is verified.
-- **Read-only:** The server writes nothing to the repositories; its only side effect is the model call.
-- **Network:** The Rust server listens only on `127.0.0.1`; only Caddy is exposed to the outside.
-- **Logging:** Structured logging with `tracing`.
-
-## 7. Deployment (Oracle Cloud Always Free)
-
-1. Create an Arm-based Ubuntu VM and add an SSH key.
-2. Open ports 80 and 443 in the security list and in the machine firewall.
-3. Point a free domain name at the VM's IP address.
-4. Caddy provides automatic HTTPS and proxies to the Rust server.
-5. Run the Rust server as a `systemd` service.
-6. The architecture is aarch64, so the Rust binary is built on the machine or cross-compiled.
-
-**Watch out for:** Free Arm capacity may be unavailable in some regions. The quota was halved in June 2026 (2 OCPU, 12 GB). Oracle's rule for reclaiming idle machines should be checked in its documentation. Card verification is required.
-
-## 8. Phase 2: Cassandra using tools
-
-The Cassandra model is a base (not instruction-tuned) language model. Its character vocabulary is very narrow, it cannot produce some symbols needed for digits and JSON, and its context window is short. It therefore cannot produce structured tool calls.
-
-**Solution:** A controller written in Python acts as an MCP client. The controller decides on its own which tool a question needs, calls the Phase 1 server, and hands the result to the model as short context. The model only writes the answer.
-
-**Further options (separate research stage):**
-
-- Constrained decoding, where the model picks the tool name only from allowed options.
-- Extending the vocabulary and training with the tool format, either from scratch or by continued training.
-
-## 9. Technology stack
-
-- Rust, `tokio`, `axum`, `rmcp`, `schemars`, `serde`, `tracing`.
-- `rusqlite` (SQLite FTS5), `notify` or periodic fetch, a `git` client.
-- Caddy, `systemd`.
-- Python side: the official `mcp` Python SDK and the Cassandra inference code.
-
-## 10. Risks and open questions
-
-- Oracle's free Arm capacity and quota may change; a small VPS or Cloud Run should be kept as a fallback.
-- Where the model weights live (repository, LFS or release) is not yet determined.
-- Whether the repositories will be public or private must be settled; if private, a GitHub token is needed.
-- The model runner's speed on CPU has not been measured.
-- Compatibility of the `rmcp` and Python SDK versions with the new specification should be verified with a connection test after installation.
-- A shared `Project` data model must be designed so that Chorus and Ephesus can be added.
-
-## 11. Roadmap
-
-1. **Phase 1:** Knowledge tools, index, GitHub sync, HTTPS and bearer token, Oracle deployment.
-2. **Phase 1.5:** `sample_text` and the model runner.
-3. **Phase 1.6:** Add Chorus and Ephesus, `compare_projects`.
-4. **Phase 2:** Python controller (MCP client), Cassandra using tools.
-5. **Phase 3 (research):** The model makes its own tool decisions.
+- Expand internal sources to Chorus, Ephesus, and other Collective projects once their scope and access policies are configured. Expose cross-project comparisons after comparable axes and their evidence are defined.
+- Add `sample_text` as an isolated optional integration once model weights, context limits, CPU latency, and tool access have been evaluated. For the base Cassandra model, a separate Python controller can select tools, validate results, and provide bounded evidence as context. Constrained or trained native tool use is a separate research milestone.
+- Evaluate embeddings, more collectors, and an optional visual digest interface only after the retrieval tests reveal a measurable gap.
